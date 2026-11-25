@@ -27,6 +27,8 @@ from src.api.main import app as fastapi_app  # noqa: E402
 from src.api.security import API_KEY_HEADER_NAME, DEFAULT_API_KEY  # noqa: E402
 from src.models.schemas import (  # noqa: E402
     CalibrationRequest,
+    GlobalScanRequest,
+    GlobalSourceName,
     InitialState,
     ParameterSweepRequest,
     SEIZParameters,
@@ -415,6 +417,56 @@ def build_calibration_fit_figure(
     return fig
 
 
+def build_global_spread_map_figure(
+    country_stats: Sequence[dict[str, Any]],
+    query: str,
+) -> go.Figure:
+    """Render an ISO-3 world choropleth map of live narrative spread and Infected share."""
+    valid_stats = [
+        item
+        for item in country_stats
+        if str(item.get("iso3", "")).upper() not in ("", "UNK")
+    ]
+    locations = [str(item["iso3"]).upper() for item in valid_stats]
+    z_values = [int(item.get("total", 0)) for item in valid_stats]
+    hover_text = [
+        (
+            f"{item.get('country_name', item['iso3'])} ({item['iso3']})<br>"
+            f"Total Mentions: {int(item.get('total', 0))}<br>"
+            f"Infected: {int(item.get('infected', 0))} "
+            f"({float(item.get('infected_share_pct', 0.0)):.1f}%)<br>"
+            f"Skeptic: {int(item.get('skeptic', 0))} | Neutral: {int(item.get('neutral', 0))}"
+        )
+        for item in valid_stats
+    ]
+
+    fig = go.Figure(
+        data=go.Choropleth(
+            locations=locations,
+            locationmode="ISO-3",
+            z=z_values,
+            text=hover_text,
+            hoverinfo="text",
+            colorscale="Reds",
+            autocolorscale=False,
+            marker_line_color="rgba(100, 116, 139, 0.5)",
+            marker_line_width=0.6,
+            colorbar={"title": "Live Mentions"},
+        )
+    )
+    fig.update_layout(
+        title=f"Worldwide Narrative Spread Map — '{query}'",
+        geo={
+            "showframe": False,
+            "showcoastlines": True,
+            "projection_type": "natural earth",
+        },
+        template="plotly_white",
+        margin={"l": 10, "r": 10, "t": 50, "b": 10},
+    )
+    return fig
+
+
 def parse_observed_csv(csv_text: str) -> tuple[list[float], list[float], list[float]]:
     """Parse observed (t, I, Z) columns from an uploaded or pasted CSV string."""
     reader = csv.DictReader(io.StringIO(csv_text.strip()))
@@ -500,8 +552,11 @@ def _request_with_fallback(
     headers = {API_KEY_HEADER_NAME: api_key}
 
     def _dispatch(http_client: Any) -> Any:
-        if method.upper() == "GET":
+        upper = method.upper()
+        if upper == "GET":
             return http_client.get(path, params=params, headers=headers)
+        if upper == "DELETE":
+            return http_client.delete(path, params=params, headers=headers)
         return http_client.post(path, json=json_body, params=params, headers=headers)
 
     if client is not None:
@@ -659,6 +714,25 @@ def run_sweep_via_api(
         api_base_url=api_base_url,
         api_key=api_key,
         json_body=sweep_request.model_dump(),
+        client=client,
+    )
+    return dict(body)
+
+
+def run_global_scan_via_api(
+    scan_request: GlobalScanRequest,
+    api_base_url: str = DEFAULT_API_BASE_URL,
+    api_key: str = DEFAULT_API_KEY,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    """Execute a live worldwide multi-source scan via POST /api/v1/global/scan."""
+    body = _request_with_fallback(
+        "POST",
+        "/api/v1/global/scan",
+        api_base_url=api_base_url,
+        api_key=api_key,
+        timeout=45.0,
+        json_body=scan_request.model_dump(),
         client=client,
     )
     return dict(body)
@@ -873,9 +947,10 @@ def render_dashboard() -> None:
         except Exception as exc:
             st.error(f"Simulation failed: {exc}")
 
-    tab_forecast, tab_intervention, tab_calibrate, tab_ops = st.tabs(
+    tab_forecast, tab_global, tab_intervention, tab_calibrate, tab_ops = st.tabs(
         [
             "Trajectory Forecast",
+            "Global Narrative Radar",
             "Counter-Messaging & Sensitivity",
             "Calibrate to Data",
             "Classifier & Run History",
@@ -944,6 +1019,151 @@ def render_dashboard() -> None:
                 "Select a disinformation scenario preset or tune SEIZ parameters in the sidebar, "
                 "then click **Run Simulation**."
             )
+
+    with tab_global:
+        st.subheader("Live Global Narrative Radar (GDELT · Bluesky · Reddit)")
+        st.caption(
+            "Query public worldwide news and social feeds in real time, classify multilingual "
+            "stance (EN/ES/FR/DE/PT/AR + fact-check domains), map ISO-3 country spread, and "
+            "fit live SEIZ trajectories."
+        )
+        gc1, gc2, gc3 = st.columns([2, 2, 1])
+        global_query = gc1.text_input("Global Narrative Query", value="vaccine")
+        global_sources: list[GlobalSourceName] = gc2.multiselect(
+            "Live Feeds",
+            options=["gdelt", "bluesky", "reddit"],
+            default=["gdelt", "bluesky", "reddit"],
+        )
+        global_timespan = gc3.selectbox("Window", ["24h", "7d", "14d"], index=1)
+
+        go1, go2, go3 = st.columns(3)
+        global_max = go1.slider("Max Items / Source", 5, 80, 30, step=5)
+        global_calibrate = go2.checkbox("Auto-calibrate SEIZ & Forecast", value=True)
+        global_vel_thresh = go3.number_input(
+            "Alert Velocity Threshold (dI/dt)", min_value=0.0, value=5.0, step=0.5
+        )
+
+        if st.button("Scan Global Spread"):
+            if not global_query.strip() or not global_sources:
+                st.warning("Enter a narrative query and select at least one live feed.")
+            else:
+                try:
+                    scan_req = GlobalScanRequest(
+                        query=global_query.strip(),
+                        sources=global_sources,
+                        max_per_source=global_max,
+                        timespan=global_timespan,
+                        calibrate=global_calibrate,
+                        population_size=max(100, int(current_state.N)),
+                        alert_velocity_threshold=float(global_vel_thresh),
+                    )
+                    with st.spinner("Scanning live worldwide feeds and classifying stance..."):
+                        scan_res = run_global_scan_via_api(
+                            scan_req,
+                            api_base_url=api_url,
+                            api_key=api_key,
+                        )
+                    st.session_state["global_scan_result"] = scan_res
+                except Exception as exc:
+                    st.error(f"Global scan failed: {exc}")
+
+        if "global_scan_result" in st.session_state:
+            scan_res = st.session_state["global_scan_result"]
+            if scan_res.get("alert_triggered"):
+                st.error(f"Viral Alert Triggered: {scan_res.get('alert_message')}")
+
+            stance = scan_res.get("stance_counts", {})
+            c_stats = scan_res.get("country_stats", [])
+            gm1, gm2, gm3, gm4 = st.columns(4)
+            gm1.metric("Total Live Mentions", f"{int(scan_res.get('total_mentions', 0)):,}")
+            gm2.metric("Infected (Amplifiers)", f"{int(stance.get('Infected', 0)):,}")
+            gm3.metric("Skeptic (Fact-Checks)", f"{int(stance.get('Skeptic', 0)):,}")
+            gm4.metric("Countries Reached", f"{len(c_stats):,}")
+
+            st.plotly_chart(
+                build_global_spread_map_figure(c_stats, str(scan_res.get("query", ""))),
+                width="stretch",
+            )
+
+            forecast_s = scan_res.get("forecast_series")
+            cal_p_dict = scan_res.get("calibrated_parameters")
+            if isinstance(forecast_s, dict) and isinstance(cal_p_dict, dict):
+                st.subheader("Live-Calibrated SEIZ Forecast")
+                st.plotly_chart(build_seiz_trajectory_figure(forecast_s), width="stretch")
+                st.json(cal_p_dict)
+                if st.button("Apply Live Calibrated Parameters to Forecast"):
+                    st.session_state["beta_val"] = float(cal_p_dict["beta"])
+                    st.session_state["p_val"] = float(cal_p_dict["p"])
+                    st.session_state["l_val"] = float(cal_p_dict["l"])
+                    st.session_state["b_val"] = float(cal_p_dict["b"])
+                    st.session_state["rho_val"] = float(cal_p_dict["rho"])
+                    st.session_state["epsilon_val"] = float(cal_p_dict["epsilon"])
+                    st.session_state["_active_preset"] = "custom"
+                    st.success("Live calibrated parameters loaded into sidebar controls.")
+
+            mentions = scan_res.get("mentions", [])
+            if mentions:
+                st.subheader("Live Geo-Attributed Mentions")
+                st.dataframe(mentions[:100], width="stretch")
+            else:
+                st.info("No live mentions matched this query window across the selected feeds.")
+
+        st.divider()
+        st.subheader("Automated Global Watchlist (Celery Beat)")
+        wc1, wc2 = st.columns([2, 1])
+        watch_name = wc1.text_input("Watchlist Monitor Name", value="Global Health Narrative")
+        watch_rsi_thresh = wc2.number_input(
+            "Alert R_SI Threshold", min_value=0.0, value=1.0, step=0.1
+        )
+        wb1, wb2 = st.columns(2)
+        if wb1.button("Save Narrative to Watchlist"):
+            if not watch_name.strip() or not global_query.strip() or not global_sources:
+                st.warning("Provide a monitor name, query, and at least one feed.")
+            else:
+                try:
+                    _request_with_fallback(
+                        "POST",
+                        "/api/v1/global/narratives",
+                        api_base_url=api_url,
+                        api_key=api_key,
+                        json_body={
+                            "name": watch_name.strip(),
+                            "query": global_query.strip(),
+                            "sources": list(global_sources),
+                            "alert_velocity_threshold": float(global_vel_thresh),
+                            "alert_rsi_threshold": float(watch_rsi_thresh),
+                            "run_initial_scan": False,
+                        },
+                    )
+                    watchlist = _request_with_fallback(
+                        "GET",
+                        "/api/v1/global/narratives",
+                        api_base_url=api_url,
+                        api_key=api_key,
+                    )
+                    st.session_state["global_watchlist"] = watchlist
+                    st.success(f"Added '{watch_name.strip()}' to the Celery Beat watchlist.")
+                except Exception as exc:
+                    st.error(f"Could not save watchlist item: {exc}")
+
+        if wb2.button("Refresh Watchlist"):
+            try:
+                watchlist = _request_with_fallback(
+                    "GET",
+                    "/api/v1/global/narratives",
+                    api_base_url=api_url,
+                    api_key=api_key,
+                )
+                st.session_state["global_watchlist"] = watchlist
+            except Exception as exc:
+                st.error(f"Could not load watchlist: {exc}")
+
+        if "global_watchlist" in st.session_state:
+            wl_rows = st.session_state["global_watchlist"]
+            if wl_rows:
+                st.dataframe(wl_rows, width="stretch")
+            else:
+                st.info("No tracked global narratives yet. Save one above to start monitoring.")
 
     with tab_intervention:
         st.subheader("Counter-Messaging & Platform Friction What-If")

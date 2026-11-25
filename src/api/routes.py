@@ -16,10 +16,16 @@ from src.api.security import (
     limiter,
     verify_api_key,
 )
+from src.ingestion.global_tracker import scan_global_narrative
 from src.ingestion.poller import InfluxTimeSeriesStore, aggregate_post_counts, classify_post
+from src.models.db import TrackedNarrative
 from src.models.schemas import (
     CalibrationRequest,
+    CountrySpreadStat,
     CurrentDataResponse,
+    GlobalMentionItem,
+    GlobalScanRequest,
+    GlobalScanResponse,
     ParameterSweepRequest,
     ParameterSweepResponse,
     PostClassificationItem,
@@ -32,18 +38,23 @@ from src.models.schemas import (
     TaskStatus,
     TaskStatusResponse,
     TaskSubmissionResponse,
+    TrackedNarrativeCreateRequest,
+    TrackedNarrativeResponse,
 )
 from src.simulation.calibration import OptimizationConvergenceError, ParameterEstimator
 from src.simulation.engine import SEIZSimulator
 from src.simulation.scenarios import get_scenario_presets
 from src.workers.celery_app import (
     _STORE_LOCK,
+    NARRATIVE_REPO,
     SIMULATION_REPO,
     TASK_STORE,
     _create_task_memory,
     _update_task_memory,
     celery_app,
+    evaluate_global_scan_with_seiz,
     execute_calibration,
+    poll_and_evaluate_narratives_task,
     reset_database_state,
     run_calibration_task,
     run_simulation_task,
@@ -51,6 +62,7 @@ from src.workers.celery_app import (
 
 __all__ = [
     "INFLUX_STORE",
+    "NARRATIVE_REPO",
     "ParameterEstimator",
     "SEIZSimulator",
     "SIMULATION_REPO",
@@ -418,3 +430,143 @@ async def analyze_social_posts(
         items=items,
         persisted=payload.persist_to_influx,
     )
+
+
+def _narrative_to_response(row: TrackedNarrative) -> TrackedNarrativeResponse:
+    """Serialize a TrackedNarrative ORM row to TrackedNarrativeResponse."""
+    return TrackedNarrativeResponse(
+        id=row.id,
+        name=row.name,
+        query=row.query,
+        sources=list(row.sources),
+        active=row.active,
+        alert_velocity_threshold=row.alert_velocity_threshold,
+        alert_rsi_threshold=row.alert_rsi_threshold,
+        last_checked_at=row.last_checked_at.isoformat() if row.last_checked_at else None,
+        last_infected_count=row.last_infected_count,
+        last_skeptic_count=row.last_skeptic_count,
+        last_max_velocity=row.last_max_velocity,
+        last_inflection_time=row.last_inflection_time,
+        last_rsi=row.last_rsi,
+        alert_triggered=row.alert_triggered,
+        alert_message=row.alert_message,
+        country_counts=row.country_counts,
+        created_at=row.created_at.isoformat(),
+        updated_at=row.updated_at.isoformat(),
+    )
+
+
+@router.post(
+    "/global/scan",
+    response_model=GlobalScanResponse,
+)
+@limiter.limit("15/minute")
+async def scan_global_spread(
+    request: Request,
+    payload: GlobalScanRequest,
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> GlobalScanResponse:
+    """Scan GDELT, Bluesky, and Reddit live for global narrative spread and SEIZ fitting."""
+    del request, _api_key
+    scan_data = await scan_global_narrative(
+        query=payload.query,
+        sources=payload.sources,
+        max_per_source=payload.max_per_source,
+        timespan=payload.timespan,
+    )
+    seiz_eval = await run_in_threadpool(
+        evaluate_global_scan_with_seiz,
+        scan_data,
+        payload.calibrate,
+        payload.population_size,
+        payload.alert_velocity_threshold,
+        payload.alert_rsi_threshold,
+    )
+    return GlobalScanResponse(
+        query=scan_data["query"],
+        sources_queried=scan_data["sources_queried"],
+        source_counts=scan_data["source_counts"],
+        total_mentions=scan_data["total_mentions"],
+        stance_counts=scan_data["stance_counts"],
+        country_stats=[CountrySpreadStat(**item) for item in scan_data["country_stats"]],
+        timestamps=scan_data["timestamps"],
+        t_observed=scan_data["t_observed"],
+        I_observed=scan_data["I_observed"],
+        Z_observed=scan_data["Z_observed"],
+        mentions=[GlobalMentionItem(**item) for item in scan_data["mentions"]],
+        calibrated_parameters=seiz_eval["calibrated_parameters"],
+        forecast_summary=seiz_eval["forecast_summary"],
+        forecast_series=seiz_eval["forecast_series"],
+        alert_triggered=bool(seiz_eval["alert_triggered"]),
+        alert_message=seiz_eval["alert_message"],
+    )
+
+
+@router.get(
+    "/global/narratives",
+    response_model=list[TrackedNarrativeResponse],
+)
+async def list_tracked_narratives(
+    active_only: bool = Query(default=False, description="Only return active watchlist monitors"),
+) -> list[TrackedNarrativeResponse]:
+    """List persisted global narrative monitors and their latest alert evaluations."""
+    rows = await NARRATIVE_REPO.list_narratives(active_only=active_only)
+    return [_narrative_to_response(row) for row in rows]
+
+
+@router.post(
+    "/global/narratives",
+    response_model=TrackedNarrativeResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_tracked_narrative(
+    payload: TrackedNarrativeCreateRequest,
+) -> TrackedNarrativeResponse:
+    """Register a global narrative monitor and optionally trigger an immediate scan."""
+    narrative_id = str(uuid.uuid4())
+    row = await NARRATIVE_REPO.create_narrative(
+        narrative_id=narrative_id,
+        name=payload.name,
+        query=payload.query,
+        sources=list(payload.sources),
+        alert_velocity_threshold=payload.alert_velocity_threshold,
+        alert_rsi_threshold=payload.alert_rsi_threshold,
+    )
+    if payload.run_initial_scan:
+        poll_and_evaluate_narratives_task.delay(narrative_id)
+        refreshed = await NARRATIVE_REPO.get_narrative(narrative_id)
+        if refreshed is not None:
+            row = refreshed
+    return _narrative_to_response(row)
+
+
+@router.post(
+    "/global/narratives/{narrative_id}/refresh",
+    response_model=TrackedNarrativeResponse,
+)
+async def refresh_tracked_narrative(narrative_id: str) -> TrackedNarrativeResponse:
+    """Trigger an on-demand global scan & SEIZ alert evaluation via Celery."""
+    existing = await NARRATIVE_REPO.get_narrative(narrative_id)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tracked narrative '{narrative_id}' not found.",
+        )
+    poll_and_evaluate_narratives_task.delay(narrative_id)
+    updated = await NARRATIVE_REPO.get_narrative(narrative_id)
+    assert updated is not None
+    return _narrative_to_response(updated)
+
+
+@router.delete(
+    "/global/narratives/{narrative_id}",
+)
+async def delete_tracked_narrative(narrative_id: str) -> dict[str, str]:
+    """Delete a tracked global narrative monitor."""
+    deleted = await NARRATIVE_REPO.delete_narrative(narrative_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tracked narrative '{narrative_id}' not found.",
+        )
+    return {"deleted_id": narrative_id}

@@ -32,6 +32,11 @@ from src.api.security import (
     reset_rate_limiter,
     resolve_rate_limit_storage_uri,
 )
+from src.ingestion.global_tracker import (
+    classify_post_multilingual,
+    normalize_country_iso3,
+    scan_global_narrative,
+)
 from src.ingestion.poller import (
     InfluxTimeSeriesStore,
     SocialMetricsPoller,
@@ -52,6 +57,7 @@ from src.simulation.scenarios import (
 )
 from src.ui.app import (
     build_calibration_fit_figure,
+    build_global_spread_map_figure,
     build_intervention_comparison_figure,
     build_seiz_trajectory_figure,
     build_sensitivity_heatmap_figure,
@@ -66,6 +72,7 @@ from src.workers.celery_app import (
     celery_app,
     get_broker_url,
     get_result_backend,
+    poll_and_evaluate_narratives_task,
     run_calibration_task,
     run_simulation_task,
 )
@@ -690,6 +697,8 @@ class TestDockerAndComposeConfiguration:
         assert "redis:" in content
         assert "redis:7-alpine" in content
         assert "celery-worker:" in content
+        assert "celery-beat:" in content
+        assert "beat" in content
         assert "src.workers.celery_app:celery_app" in content
         assert "CELERY_BROKER_URL" in content
         assert "replicas:" in content
@@ -1101,9 +1110,12 @@ class TestDatabaseModelsAndAlembicMigrations:
 
         command.upgrade(cfg, "head")
         tables_up, run_cols, traj_cols = asyncio.run(_get_tables_and_columns())
-        assert {"alembic_version", "simulation_runs", "trajectory_data"}.issubset(
-            tables_up
-        )
+        assert {
+            "alembic_version",
+            "simulation_runs",
+            "trajectory_data",
+            "tracked_narratives",
+        }.issubset(tables_up)
         assert {
             "id",
             "task_type",
@@ -1130,6 +1142,7 @@ class TestDatabaseModelsAndAlembicMigrations:
         tables_down, _, _ = asyncio.run(_get_tables_and_columns())
         assert "simulation_runs" not in tables_down
         assert "trajectory_data" not in tables_down
+        assert "tracked_narratives" not in tables_down
 
 
 class TestCeleryWorkerAndBrokerIntegration:
@@ -1421,3 +1434,280 @@ class TestAnalystWorkbenchAndEndpoints:
         assert isinstance(
             build_calibration_fit_figure(t_obs, i_obs, z_obs, series), go.Figure
         )
+
+
+class TestGlobalNarrativeTracking:
+    """Tests for multilingual live GDELT/Bluesky/Reddit tracking, world maps, and Celery Beat."""
+
+    def test_multilingual_stance_classifier_and_country_iso3_normalization(self) -> None:
+        assert classify_post_multilingual("Urgente: conspiracion filtrada, comparte ahora!") == (
+            "Infected"
+        )
+        assert classify_post_multilingual("Verificado: bulo desmentido y falso") == "Skeptic"
+        assert classify_post_multilingual("Faktencheck: diese Behauptung wurde widerlegt") == (
+            "Skeptic"
+        )
+        assert classify_post_multilingual("Alerte complot scandale, partagez vite") == "Infected"
+        assert (
+            classify_post_multilingual(
+                "Breaking viral headline", url="https://www.snopes.com/fact-check/example"
+            )
+            == "Skeptic"
+        )
+        assert classify_post_multilingual("Regional parliamentary schedule for Thursday") == (
+            "Neutral"
+        )
+
+        assert normalize_country_iso3("United States") == ("USA", "United States")
+        assert normalize_country_iso3("Germany") == ("DEU", "Germany")
+        assert normalize_country_iso3("Brazil") == ("BRA", "Brazil")
+        assert normalize_country_iso3(None, language="es-ES") == ("ESP", "ESP")
+        assert normalize_country_iso3(None) == ("USA", "Global / Unattributed")
+
+    def test_scan_global_narrative_parses_gdelt_bluesky_and_reddit_feeds(self) -> None:
+        def _mock_handler(request: httpx.Request) -> httpx.Response:
+            host = request.url.host
+            if "gdeltproject.org" in host:
+                return httpx.Response(
+                    200,
+                    json={
+                        "articles": [
+                            {
+                                "title": "Breaking leaked cover-up exposed in capital",
+                                "url": "https://news.example.com/a1",
+                                "domain": "news.example.com",
+                                "seendate": "20260401T100000Z",
+                                "sourcecountry": "United States",
+                                "language": "English",
+                            },
+                            {
+                                "title": "Faktencheck: Behauptung wurde als falsch widerlegt",
+                                "url": "https://correctiv.org/check",
+                                "domain": "correctiv.org",
+                                "seendate": "20260401T120000Z",
+                                "sourcecountry": "Germany",
+                                "language": "German",
+                            },
+                        ]
+                    },
+                )
+            if "bsky.app" in host:
+                return httpx.Response(
+                    200,
+                    json={
+                        "posts": [
+                            {
+                                "uri": "at://did:plc:123/app.bsky.feed.post/abc1",
+                                "author": {"handle": "user.bsky.social"},
+                                "record": {
+                                    "text": "Urgente: conspiracion filtrada, comparte ahora!",
+                                    "createdAt": "2026-04-01T13:00:00Z",
+                                    "langs": ["es-ES"],
+                                },
+                            }
+                        ]
+                    },
+                )
+            if "reddit.com" in host:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "children": [
+                                {
+                                    "data": {
+                                        "title": "Fact-check: claim debunked as fabricated hoax",
+                                        "selftext": "Auditors verified normal operations.",
+                                        "permalink": "/r/news/comments/xyz/check",
+                                        "created_utc": 1775052000.0,
+                                        "subreddit": "news",
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                )
+            return httpx.Response(404)
+
+        async def _run_scan() -> dict[str, object]:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_mock_handler)) as mock_c:
+                return await scan_global_narrative(
+                    query="election_rumor",
+                    sources=("gdelt", "bluesky", "reddit"),
+                    max_per_source=10,
+                    http_client=mock_c,
+                )
+
+        result = asyncio.run(_run_scan())
+        assert result["total_mentions"] == 4
+        assert result["source_counts"] == {"gdelt": 2, "bluesky": 1, "reddit": 1}
+        assert result["stance_counts"] == {"Infected": 2, "Skeptic": 2, "Neutral": 0}
+        country_isos = {item["iso3"] for item in result["country_stats"]}  # type: ignore[index]
+        assert {"USA", "DEU", "ESP"}.issubset(country_isos)
+        assert len(result["t_observed"]) >= 2  # type: ignore[arg-type]
+        assert result["I_observed"][-1] == 2.0  # type: ignore[index]
+        assert result["Z_observed"][-1] == 2.0  # type: ignore[index]
+
+    def test_global_scan_endpoint_with_seiz_calibration_and_choropleth_map(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_scan_payload = {
+            "query": "vaccine_hoax",
+            "sources_queried": ["gdelt", "bluesky"],
+            "source_counts": {"gdelt": 4, "bluesky": 2},
+            "total_mentions": 6,
+            "stance_counts": {"Infected": 4, "Skeptic": 2, "Neutral": 0},
+            "country_stats": [
+                {
+                    "iso3": "USA",
+                    "country_name": "United States",
+                    "total": 3,
+                    "infected": 2,
+                    "skeptic": 1,
+                    "neutral": 0,
+                    "infected_share_pct": 66.7,
+                },
+                {
+                    "iso3": "DEU",
+                    "country_name": "Germany",
+                    "total": 3,
+                    "infected": 2,
+                    "skeptic": 1,
+                    "neutral": 0,
+                    "infected_share_pct": 66.7,
+                },
+            ],
+            "timestamps": [
+                "2026-04-01T10:00:00+00:00",
+                "2026-04-01T11:00:00+00:00",
+                "2026-04-01T12:00:00+00:00",
+                "2026-04-01T13:00:00+00:00",
+            ],
+            "t_observed": [0.0, 1.0, 2.0, 3.0],
+            "I_observed": [1.0, 2.0, 3.0, 4.0],
+            "Z_observed": [0.0, 1.0, 1.0, 2.0],
+            "mentions": [
+                {
+                    "source": "gdelt",
+                    "title": "Viral leaked proof spreading fast",
+                    "url": "https://example.org/1",
+                    "published_at": "2026-04-01T10:00:00+00:00",
+                    "country_iso3": "USA",
+                    "country_name": "United States",
+                    "language": "en",
+                    "label": "Infected",
+                }
+            ],
+        }
+
+        async def _fake_scan(**_kwargs: object) -> dict[str, object]:
+            return mock_scan_payload
+
+        monkeypatch.setattr(api_routes, "scan_global_narrative", _fake_scan)
+
+        resp = client.post(
+            "/api/v1/global/scan",
+            json={
+                "query": "vaccine_hoax",
+                "sources": ["gdelt", "bluesky"],
+                "calibrate": True,
+                "alert_velocity_threshold": 0.01,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_mentions"] == 6
+        assert body["calibrated_parameters"] is not None
+        assert body["forecast_summary"] is not None
+        assert body["forecast_series"] is not None
+        assert body["alert_triggered"] is True
+        assert body["alert_message"] is not None
+
+        map_fig = build_global_spread_map_figure(body["country_stats"], body["query"])
+        assert isinstance(map_fig, go.Figure)
+        assert len(map_fig.data) == 1
+        assert isinstance(map_fig.data[0], go.Choropleth)
+
+    def test_global_watchlist_crud_and_celery_beat_monitoring(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import sys
+
+        celery_module = sys.modules["src.workers.celery_app"]
+
+        assert "poll-global-narratives" in celery_app.conf.beat_schedule
+        assert (
+            "src.workers.celery_app.poll_and_evaluate_narratives_task" in celery_app.tasks
+        )
+
+        mock_scan_payload = {
+            "query": "election_hoax",
+            "sources_queried": ["gdelt"],
+            "source_counts": {"gdelt": 3},
+            "total_mentions": 3,
+            "stance_counts": {"Infected": 2, "Skeptic": 1, "Neutral": 0},
+            "country_stats": [
+                {
+                    "iso3": "FRA",
+                    "country_name": "France",
+                    "total": 3,
+                    "infected": 2,
+                    "skeptic": 1,
+                    "neutral": 0,
+                    "infected_share_pct": 66.7,
+                }
+            ],
+            "timestamps": [
+                "2026-04-01T10:00:00+00:00",
+                "2026-04-01T11:00:00+00:00",
+                "2026-04-01T12:00:00+00:00",
+            ],
+            "t_observed": [0.0, 1.0, 2.0],
+            "I_observed": [1.0, 2.0, 2.0],
+            "Z_observed": [0.0, 0.0, 1.0],
+            "mentions": [],
+        }
+
+        async def _fake_worker_scan(**_kwargs: object) -> dict[str, object]:
+            return mock_scan_payload
+
+        monkeypatch.setattr(celery_module, "scan_global_narrative", _fake_worker_scan)
+
+        create_resp = client.post(
+            "/api/v1/global/narratives",
+            json={
+                "name": "EU Election Rumor Watch",
+                "query": "election_hoax",
+                "sources": ["gdelt"],
+                "alert_velocity_threshold": 0.01,
+                "run_initial_scan": True,
+            },
+        )
+        assert create_resp.status_code == 201
+        created = create_resp.json()
+        narrative_id = created["id"]
+        assert created["last_infected_count"] == 2
+        assert created["last_skeptic_count"] == 1
+        assert created["country_counts"] == {"FRA": 3}
+        assert created["alert_triggered"] is True
+
+        list_resp = client.get("/api/v1/global/narratives")
+        assert list_resp.status_code == 200
+        assert any(row["id"] == narrative_id for row in list_resp.json())
+
+        refresh_resp = client.post(f"/api/v1/global/narratives/{narrative_id}/refresh")
+        assert refresh_resp.status_code == 200
+        assert refresh_resp.json()["last_checked_at"] is not None
+
+        beat_async = poll_and_evaluate_narratives_task.delay(None)
+        assert beat_async.successful() is True
+        assert beat_async.result["evaluated_count"] == 1
+        assert beat_async.result["alerts_fired"] == 1
+
+        del_resp = client.delete(f"/api/v1/global/narratives/{narrative_id}")
+        assert del_resp.status_code == 200
+        assert del_resp.json()["deleted_id"] == narrative_id

@@ -17,10 +17,22 @@ import numpy as np
 import structlog
 from celery import Celery
 
-from src.models.db import PERCENTILE_SERIES_KEYS, SimulationRepository
-from src.models.schemas import CalibrationRequest, SimulationRequest, TaskStatus
-from src.simulation.calibration import ParameterEstimator
+from src.ingestion.global_tracker import SupportedSource, scan_global_narrative
+from src.models.db import (
+    PERCENTILE_SERIES_KEYS,
+    NarrativeRepository,
+    SimulationRepository,
+)
+from src.models.schemas import (
+    CalibrationRequest,
+    InitialState,
+    SEIZParameters,
+    SimulationRequest,
+    TaskStatus,
+)
+from src.simulation.calibration import OptimizationConvergenceError, ParameterEstimator
 from src.simulation.engine import SEIZSimulator, SimulationResult, configure_structlog
+from src.simulation.scenarios import compute_epidemiological_summary, compute_spreading_ratio
 
 configure_structlog()
 logger = structlog.get_logger(__name__)
@@ -30,6 +42,7 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 TASK_STORE: dict[str, dict[str, Any]] = {}
 _STORE_LOCK = threading.Lock()
 SIMULATION_REPO = SimulationRepository()
+NARRATIVE_REPO = NarrativeRepository()
 
 
 class AsyncResultProtocol(Protocol):
@@ -119,6 +132,12 @@ def _create_celery_app() -> Celery:
         "enable_utc": True,
         "task_track_started": True,
         "broker_connection_retry_on_startup": True,
+        "beat_schedule": {
+            "poll-global-narratives": {
+                "task": "src.workers.celery_app.poll_and_evaluate_narratives_task",
+                "schedule": float(os.getenv("CELERY_BEAT_POLL_SECONDS", "900")),
+            }
+        },
     }
     if use_eager:
         config_updates.update(
@@ -179,8 +198,9 @@ def _update_task_memory(task_id: str, **fields: Any) -> None:
 
 
 async def reset_database_state() -> None:
-    """Clear persisted SimulationRun/TrajectoryData rows and in-memory TASK_STORE."""
+    """Clear persisted SimulationRun/TrajectoryData/TrackedNarrative rows and TASK_STORE."""
     await SIMULATION_REPO.clear_all()
+    await NARRATIVE_REPO.clear_all()
     with _STORE_LOCK:
         TASK_STORE.clear()
 
@@ -412,4 +432,177 @@ run_calibration_task: CeleryTaskProtocol[[dict[str, Any]], dict[str, Any]] = cas
         bind=True,
         name="src.workers.celery_app.run_calibration_task",
     )(_run_calibration_task_impl),
+)
+
+
+def evaluate_global_scan_with_seiz(
+    scan_data: dict[str, Any],
+    calibrate: bool = True,
+    population_size: int = 10_000,
+    velocity_threshold: float = 5.0,
+    rsi_threshold: float = 1.0,
+) -> dict[str, Any]:
+    """Fit SEIZ parameters to live global (I, Z) data, forecast trajectory, and check alerts."""
+    t_obs = [float(v) for v in scan_data.get("t_observed", [])]
+    i_obs = [float(v) for v in scan_data.get("I_observed", [])]
+    z_obs = [float(v) for v in scan_data.get("Z_observed", [])]
+    stance_counts = scan_data.get("stance_counts", {})
+    infected_total = int(stance_counts.get("Infected", 0))
+
+    calibrated_params: SEIZParameters | None = None
+    forecast_summary: dict[str, Any] | None = None
+    forecast_series: dict[str, list[float]] | None = None
+
+    has_signal = len(t_obs) >= 2 and t_obs[-1] > t_obs[0] and (max(i_obs) > 0 or max(z_obs) > 0)
+    if calibrate and has_signal:
+        i0 = max(1, int(round(i_obs[0])))
+        z0 = max(0, int(round(z_obs[0])))
+        e0 = max(1, i0 // 2)
+        s0 = max(10, int(population_size) - i0 - z0 - e0)
+        init_state = InitialState(S0=s0, E0=e0, I0=i0, Z0=z0)
+        try:
+            calibrated_params = ParameterEstimator().fit_to_data(
+                t_observed=t_obs,
+                I_observed=i_obs,
+                Z_observed=z_obs,
+                initial_state=init_state,
+                maxiter=120,
+            )
+        except (OptimizationConvergenceError, ValueError, RuntimeError):
+            calibrated_params = SEIZParameters(
+                beta=0.6, p=0.3, l=0.35, b=0.25, rho=0.2, epsilon=0.08
+            )
+
+        horizon = max(float(t_obs[-1]) * 2.0, 48.0)
+        sim_res = SEIZSimulator().solve(
+            state=init_state,
+            params=calibrated_params,
+            t_span=(0.0, horizon),
+            num_points=120,
+            _log_simulation=False,
+        )
+        forecast_series = series_to_dict(sim_res)
+        forecast_summary = compute_epidemiological_summary(
+            forecast_series, params=calibrated_params
+        )
+
+    alert_reasons: list[str] = []
+    max_vel: float | None = None
+    inflection_t: float | None = None
+    rsi_val: float | None = None
+
+    if forecast_summary is not None:
+        max_vel = float(forecast_summary["max_viral_velocity"])
+        inflection_t = float(forecast_summary["inflection_time"])
+        raw_rsi = forecast_summary.get("spreading_ratio_rsi")
+        rsi_val = float(raw_rsi) if isinstance(raw_rsi, (int, float)) else None
+
+        if max_vel >= velocity_threshold and infected_total > 0:
+            alert_reasons.append(
+                f"projected peak velocity {max_vel:.2f}/hr >= threshold {velocity_threshold:.2f}/hr"
+            )
+        if rsi_val is not None and rsi_val <= rsi_threshold and infected_total > 0:
+            alert_reasons.append(
+                f"direct viral spread regime (R_SI={rsi_val:.2f} <= {rsi_threshold:.2f})"
+            )
+    elif calibrated_params is not None:
+        rsi_val, _ = compute_spreading_ratio(calibrated_params)
+
+    alert_triggered = len(alert_reasons) > 0
+    alert_message = "; ".join(alert_reasons) if alert_triggered else None
+
+    return {
+        "calibrated_parameters": calibrated_params,
+        "forecast_summary": forecast_summary,
+        "forecast_series": forecast_series,
+        "max_viral_velocity": max_vel,
+        "inflection_time": inflection_t,
+        "rsi": rsi_val,
+        "alert_triggered": alert_triggered,
+        "alert_message": alert_message,
+    }
+
+
+def _poll_and_evaluate_narratives_impl(
+    self: Any,
+    narrative_id: str | None = None,
+) -> dict[str, Any]:
+    """Celery Beat task polling active global narratives, recalibrating SEIZ, and alerting."""
+    del self
+
+    async def _run_batch() -> dict[str, Any]:
+        if narrative_id is not None:
+            single = await NARRATIVE_REPO.get_narrative(narrative_id)
+            targets = [single] if single is not None else []
+        else:
+            targets = await NARRATIVE_REPO.list_narratives(active_only=True)
+
+        evaluated: list[dict[str, Any]] = []
+        alerts_fired = 0
+
+        for row in targets:
+            valid_sources: list[SupportedSource] = [
+                cast(SupportedSource, src)
+                for src in row.sources
+                if src in ("gdelt", "bluesky", "reddit")
+            ] or ["gdelt", "bluesky", "reddit"]
+            scan_data = await scan_global_narrative(
+                query=row.query,
+                sources=valid_sources,
+                max_per_source=30,
+            )
+            seiz_eval = evaluate_global_scan_with_seiz(
+                scan_data,
+                calibrate=True,
+                velocity_threshold=row.alert_velocity_threshold,
+                rsi_threshold=row.alert_rsi_threshold,
+            )
+            country_counts = {
+                str(stat["iso3"]): int(stat["total"])
+                for stat in scan_data.get("country_stats", [])
+            }
+            counts = scan_data.get("stance_counts", {})
+            await NARRATIVE_REPO.update_snapshot(
+                narrative_id=row.id,
+                infected_count=int(counts.get("Infected", 0)),
+                skeptic_count=int(counts.get("Skeptic", 0)),
+                country_counts=country_counts,
+                max_velocity=seiz_eval["max_viral_velocity"],
+                inflection_time=seiz_eval["inflection_time"],
+                rsi=seiz_eval["rsi"],
+                alert_triggered=bool(seiz_eval["alert_triggered"]),
+                alert_message=seiz_eval["alert_message"],
+            )
+            if seiz_eval["alert_triggered"]:
+                alerts_fired += 1
+                logger.warning(
+                    "narrative_alert_triggered",
+                    narrative_id=row.id,
+                    narrative_name=row.name,
+                    query=row.query,
+                    alert_message=seiz_eval["alert_message"],
+                )
+            evaluated.append(
+                {
+                    "narrative_id": row.id,
+                    "total_mentions": int(scan_data.get("total_mentions", 0)),
+                    "alert_triggered": bool(seiz_eval["alert_triggered"]),
+                }
+            )
+
+        return {
+            "evaluated_count": len(evaluated),
+            "alerts_fired": alerts_fired,
+            "narratives": evaluated,
+        }
+
+    return _run_async(_run_batch())
+
+
+poll_and_evaluate_narratives_task: CeleryTaskProtocol[[str | None], dict[str, Any]] = cast(
+    CeleryTaskProtocol[[str | None], dict[str, Any]],
+    celery_app.task(
+        bind=True,
+        name="src.workers.celery_app.poll_and_evaluate_narratives_task",
+    )(_poll_and_evaluate_narratives_impl),
 )

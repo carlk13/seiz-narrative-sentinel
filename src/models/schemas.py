@@ -489,3 +489,130 @@ class PostClassificationResponse(BaseModel):
     counts: dict[str, int]
     items: list[PostClassificationItem]
     persisted: bool
+
+
+GlobalSourceName = Literal["gdelt", "bluesky", "reddit"]
+
+
+def _default_global_sources() -> list[GlobalSourceName]:
+    """Return the default list of live public global feeds."""
+    return ["gdelt", "bluesky", "reddit"]
+
+
+class GlobalScanRequest(BaseModel):
+    """Request payload for a live multi-source worldwide narrative scan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(..., min_length=2, max_length=256, description="Narrative or keyword query")
+    sources: list[GlobalSourceName] = Field(
+        default_factory=_default_global_sources,
+        min_length=1,
+        description="Public live global feeds to query concurrently",
+    )
+    max_per_source: StrictInt = Field(default=35, ge=5, le=100)
+    timespan: str = Field(default="7d", min_length=2, max_length=16)
+    calibrate: bool = Field(
+        default=False,
+        description="If true, fit SEIZ parameters on the live observed (I, Z) curve",
+    )
+    population_size: StrictInt = Field(
+        default=10_000,
+        ge=100,
+        le=100_000_000,
+        description="Target audience population N when running live SEIZ calibration",
+    )
+    alert_velocity_threshold: float = Field(default=5.0, ge=0.0)
+    alert_rsi_threshold: float = Field(default=1.0, ge=0.0)
+
+    @field_validator("max_per_source", "population_size", mode="before")
+    @classmethod
+    def _reject_bool_global_ints(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Integer scan configuration fields must not be booleans.")
+        return value
+
+
+class GlobalMentionItem(BaseModel):
+    """Single geo-attributed live mention returned by a global feed."""
+
+    source: GlobalSourceName
+    title: str
+    url: str
+    published_at: str
+    country_iso3: str
+    country_name: str
+    language: str
+    label: Literal["Infected", "Skeptic", "Neutral"]
+
+
+class CountrySpreadStat(BaseModel):
+    """Aggregated country-level narrative spread statistics for choropleth mapping."""
+
+    iso3: str
+    country_name: str
+    total: int
+    infected: int
+    skeptic: int
+    neutral: int
+    infected_share_pct: float
+
+
+class GlobalScanResponse(BaseModel):
+    """Live worldwide narrative scan with geo-breakdown, SEIZ series, and optional forecast."""
+
+    query: str
+    sources_queried: list[GlobalSourceName]
+    source_counts: dict[str, int]
+    total_mentions: int
+    stance_counts: dict[str, int]
+    country_stats: list[CountrySpreadStat]
+    timestamps: list[str]
+    t_observed: list[float]
+    I_observed: list[float]
+    Z_observed: list[float]
+    mentions: list[GlobalMentionItem]
+    calibrated_parameters: SEIZParameters | None = None
+    forecast_summary: dict[str, Any] | None = None
+    forecast_series: dict[str, list[float]] | None = None
+    alert_triggered: bool = False
+    alert_message: str | None = None
+
+
+class TrackedNarrativeCreateRequest(BaseModel):
+    """Request to register a global narrative in the Celery Beat monitoring watchlist."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=2, max_length=160)
+    query: str = Field(..., min_length=2, max_length=256)
+    sources: list[GlobalSourceName] = Field(
+        default_factory=_default_global_sources,
+        min_length=1,
+    )
+    alert_velocity_threshold: float = Field(default=5.0, ge=0.0)
+    alert_rsi_threshold: float = Field(default=1.0, ge=0.0)
+    run_initial_scan: bool = Field(default=True)
+
+
+class TrackedNarrativeResponse(BaseModel):
+    """Persisted watchlist entry with latest global counts, SEIZ forecast, and alert state."""
+
+    id: str
+    name: str
+    query: str
+    sources: list[str]
+    active: bool
+    alert_velocity_threshold: float
+    alert_rsi_threshold: float
+    last_checked_at: str | None = None
+    last_infected_count: int
+    last_skeptic_count: int
+    last_max_velocity: float | None = None
+    last_inflection_time: float | None = None
+    last_rsi: float | None = None
+    alert_triggered: bool
+    alert_message: str | None = None
+    country_counts: dict[str, int] | None = None
+    created_at: str
+    updated_at: str

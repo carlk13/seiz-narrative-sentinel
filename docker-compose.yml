@@ -95,6 +95,35 @@ services:
       - seiz_network
     restart: unless-stopped
 
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: seiz_celery_beat
+    command:
+      [
+        "celery",
+        "-A",
+        "src.workers.celery_app:celery_app",
+        "beat",
+        "--loglevel=info",
+      ]
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-seiz_tracker}"
+      REDIS_URL: "redis://redis:6379/0"
+      CELERY_BROKER_URL: "redis://redis:6379/0"
+      CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+      CELERY_BEAT_POLL_SECONDS: "${CELERY_BEAT_POLL_SECONDS:-900}"
+      SEIZ_API_KEY: "${SEIZ_API_KEY:-seiz-secret-api-key}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - seiz_network
+    restart: unless-stopped
+
   ui:
     build:
       context: .

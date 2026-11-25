@@ -109,9 +109,10 @@ uv run streamlit run src/ui/app.py --server.port 8501
 ## Analyst Workbench Features (`src/ui/app.py`)
 
 1. **Trajectory Forecast:** Choose from 5 built-in disinformation presets (*Breaking Election Rumor*, *Health Misinformation*, *Rapid Fact-Check Counter-Campaign*, *Polarized Echo Chamber*, *Coordinated Bot Amplification*), run deterministic or 1,000-run stochastic Gillespie simulations, inspect $R_{SI}$, peak viral velocity ($\max dI/dt$), and inflection time ($t^*$), and download CSV trajectories or JSON intelligence reports.
-2. **Counter-Messaging & Sensitivity Lab:** Model platform friction ($\beta$ reduction) and fact-checking interventions ($+b$, target $l$) to quantify **Infected Averted**, **Peak Velocity Reduction (%)**, and **Inflection Delay ($\Delta t^*$)**, plus run interactive **Eigen3 2D Parameter Sensitivity Heatmaps**.
-3. **Calibrate to Observed Data:** Upload or paste `(t, I, Z)` CSVs, pull live minute-level series from InfluxDB, or load a sample outbreak dataset; run bounded **L-BFGS-B** parameter estimation, inspect SSE / RMSE / $R^2$ fit overlays, and load recovered parameters directly into the forecast simulator.
-4. **Narrative Classifier & Run History:** Test the deterministic NLP post classifier (`Infected` / `Skeptic` / `Neutral`) on raw posts/headlines, optionally persist snapshots to InfluxDB, and inspect persisted PostgreSQL simulation & calibration run history.
+2. **Global Narrative Radar (Live Worldwide Tracking):** Query live public global feeds (**GDELT 2.0 Global News**, **Bluesky ATProto**, and **Reddit**) concurrently with zero API keys required, classify multilingual posts (EN, ES, FR, DE, PT, AR + fact-checker domains) into `Infected`/`Skeptic`/`Neutral`, visualize country-by-country spread on an interactive **ISO-3 Plotly World Choropleth Map**, auto-calibrate SEIZ parameters on the live observed curve, and register narratives in the **24/7 Celery Beat Watchlist** for automated viral-velocity & $R_{SI}$ early-warning alerts.
+3. **Counter-Messaging & Sensitivity Lab:** Model platform friction ($\beta$ reduction) and fact-checking interventions ($+b$, target $l$) to quantify **Infected Averted**, **Peak Velocity Reduction (%)**, and **Inflection Delay ($\Delta t^*$)**, plus run interactive **Eigen3 2D Parameter Sensitivity Heatmaps**.
+4. **Calibrate to Observed Data:** Upload or paste `(t, I, Z)` CSVs, pull live minute-level series from InfluxDB, or load a sample outbreak dataset; run bounded **L-BFGS-B** parameter estimation, inspect SSE / RMSE / $R^2$ fit overlays, and load recovered parameters directly into the forecast simulator.
+5. **Narrative Classifier & Run History:** Test the deterministic NLP post classifier (`Infected` / `Skeptic` / `Neutral`) on raw posts/headlines, optionally persist snapshots to InfluxDB, and inspect persisted PostgreSQL simulation & calibration run history.
 
 ---
 
@@ -125,6 +126,11 @@ All endpoints require the `X-API-Key` header (default in local dev: `seiz-secret
 | `POST` | `/api/v1/calibrate` | 5/min | Calibrate SEIZ parameters to observed `(t, I, Z)` via L-BFGS-B (`202` + `task_id`) |
 | `GET` | `/api/v1/results/{task_id}` | — | Poll task status (`pending`, `processing`, `completed`, `failed`) & result arrays |
 | `POST` | `/api/v1/sweep` | 15/min | Execute Eigen3 vectorized 2D parameter sensitivity sweep (up to 2,500 runs) |
+| `POST` | `/api/v1/global/scan` | 15/min | Scan live GDELT/Bluesky/Reddit global feeds, map countries, & auto-calibrate SEIZ |
+| `GET` | `/api/v1/global/narratives` | — | List persisted 24/7 global watchlist monitors and latest alert statuses |
+| `POST` | `/api/v1/global/narratives` | — | Add a global narrative to the Celery Beat monitoring & alerting watchlist |
+| `POST` | `/api/v1/global/narratives/{id}/refresh` | — | Trigger an immediate global poll & SEIZ alert evaluation via Celery |
+| `DELETE` | `/api/v1/global/narratives/{id}` | — | Remove a narrative from the global watchlist |
 | `GET` | `/api/v1/presets` | — | Retrieve curated disinformation scenario presets |
 | `GET` | `/api/v1/runs` | — | List recent persisted `SimulationRun` records from PostgreSQL |
 | `GET` | `/api/v1/data/current` | — | Query InfluxDB for minute-level `I(t)` and `Z(t)` arrays |

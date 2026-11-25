@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -166,7 +166,7 @@ def compute_spreading_ratio(params: SEIZParameters) -> tuple[float | None, str]:
 
 
 def compute_epidemiological_summary(
-    series: dict[str, Sequence[float] | np.ndarray],
+    series: Mapping[str, Sequence[float] | np.ndarray],
     params: SEIZParameters | None = None,
 ) -> dict[str, Any]:
     """Compute analyst-ready KPIs from a simulated SEIZ trajectory."""

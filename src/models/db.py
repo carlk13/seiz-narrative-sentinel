@@ -10,7 +10,18 @@ from typing import Any
 from urllib.parse import urlparse
 
 import structlog
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, delete, select
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    delete,
+    select,
+)
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -375,4 +386,167 @@ class SimulationRepository:
         async with self.session_factory() as session:
             await session.execute(delete(TrajectoryData))
             await session.execute(delete(SimulationRun))
+            await session.commit()
+
+
+class TrackedNarrative(Base):
+    """Persistent global narrative monitor with latest country stats and alert state."""
+
+    __tablename__ = "tracked_narratives"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    query: Mapped[str] = mapped_column(String(256), nullable=False)
+    sources: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, index=True, default=True)
+    alert_velocity_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=25.0)
+    alert_rsi_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_infected_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_skeptic_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_max_velocity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_inflection_time: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_rsi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    alert_triggered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    alert_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    country_counts: Mapped[dict[str, int] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
+class NarrativeRepository:
+    """Async repository managing TrackedNarrative watchlist rows and alert snapshots."""
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        target_engine: AsyncEngine | None = None,
+    ) -> None:
+        self.engine: AsyncEngine = target_engine if target_engine is not None else engine
+        self.session_factory: async_sessionmaker[AsyncSession] = (
+            session_factory
+            if session_factory is not None
+            else (
+                AsyncSessionLocal
+                if target_engine is None
+                else async_sessionmaker(
+                    bind=target_engine,
+                    class_=AsyncSession,
+                    expire_on_commit=False,
+                )
+            )
+        )
+
+    async def _ensure_initialized(self) -> None:
+        if id(self.engine) not in _INITIALIZED_ENGINE_IDS:
+            await init_db(self.engine)
+
+    async def create_narrative(
+        self,
+        narrative_id: str,
+        name: str,
+        query: str,
+        sources: list[str],
+        alert_velocity_threshold: float = 25.0,
+        alert_rsi_threshold: float = 1.0,
+    ) -> TrackedNarrative:
+        """Insert a new tracked global narrative monitor."""
+        await self._ensure_initialized()
+        now = datetime.now(UTC)
+        async with self.session_factory() as session:
+            row = TrackedNarrative(
+                id=narrative_id,
+                name=name,
+                query=query,
+                sources=list(sources),
+                active=True,
+                alert_velocity_threshold=alert_velocity_threshold,
+                alert_rsi_threshold=alert_rsi_threshold,
+                last_infected_count=0,
+                last_skeptic_count=0,
+                alert_triggered=False,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_narratives(self, active_only: bool = False) -> list[TrackedNarrative]:
+        """List tracked narratives newest-first."""
+        await self._ensure_initialized()
+        async with self.session_factory() as session:
+            stmt = select(TrackedNarrative).order_by(TrackedNarrative.created_at.desc())
+            if active_only:
+                stmt = stmt.where(TrackedNarrative.active.is_(True))
+            return list((await session.execute(stmt)).scalars().all())
+
+    async def get_narrative(self, narrative_id: str) -> TrackedNarrative | None:
+        """Fetch a single TrackedNarrative by ID."""
+        await self._ensure_initialized()
+        async with self.session_factory() as session:
+            stmt = select(TrackedNarrative).where(TrackedNarrative.id == narrative_id)
+            return (await session.execute(stmt)).scalar_one_or_none()
+
+    async def update_snapshot(
+        self,
+        narrative_id: str,
+        infected_count: int,
+        skeptic_count: int,
+        country_counts: dict[str, int],
+        max_velocity: float | None = None,
+        inflection_time: float | None = None,
+        rsi: float | None = None,
+        alert_triggered: bool = False,
+        alert_message: str | None = None,
+    ) -> TrackedNarrative | None:
+        """Persist latest global scan metrics and alert evaluation on a narrative."""
+        await self._ensure_initialized()
+        async with self.session_factory() as session:
+            stmt = select(TrackedNarrative).where(TrackedNarrative.id == narrative_id)
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row is None:
+                return None
+            now = datetime.now(UTC)
+            row.last_checked_at = now
+            row.updated_at = now
+            row.last_infected_count = int(infected_count)
+            row.last_skeptic_count = int(skeptic_count)
+            row.country_counts = dict(country_counts)
+            row.last_max_velocity = max_velocity
+            row.last_inflection_time = inflection_time
+            row.last_rsi = rsi
+            row.alert_triggered = bool(alert_triggered)
+            row.alert_message = alert_message
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def delete_narrative(self, narrative_id: str) -> bool:
+        """Delete a tracked narrative by ID, returning True if a row was removed."""
+        await self._ensure_initialized()
+        async with self.session_factory() as session:
+            stmt = select(TrackedNarrative).where(TrackedNarrative.id == narrative_id)
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
+
+    async def clear_all(self) -> None:
+        """Delete all TrackedNarrative rows (used for test isolation)."""
+        await self._ensure_initialized()
+        async with self.session_factory() as session:
+            await session.execute(delete(TrackedNarrative))
             await session.commit()
