@@ -1,6 +1,6 @@
-# SEIZ Disinformation Trajectory Simulator
+# SEIZ Narrative Sentinel
 
-An enterprise-grade epidemiological simulation, parameter calibration, and Trust & Safety analyst workbench for modeling the viral spread and counter-messaging containment of digital disinformation across social networks.
+An enterprise-grade epidemiological simulation, live worldwide narrative radar, parameter calibration, and Trust & Safety analyst workbench for tracking and modeling the viral spread and counter-messaging containment of digital disinformation across social networks.
 
 Built on the **SEIZ** (**S**usceptible, **E**xposed, **I**nfected, **Z**keptic) compartmental model with a **C++17 / pybind11 / Eigen3** numerical core, **FastAPI** asynchronous REST API, **Celery + Redis** distributed worker queue, **PostgreSQL + Alembic** persistence, **InfluxDB v2** live social ingestion, **Prometheus + structlog** observability, and an interactive **Streamlit + Plotly** analyst dashboard.
 

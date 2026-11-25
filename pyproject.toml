@@ -1,5 +1,5 @@
 [project]
-name = "014-disinfo-tracker"
+name = "seiz-narrative-sentinel"
 version = "0.1.0"
 description = "SEIZ disinformation trajectory simulator with C++17/Eigen3/pybind11 core, FastAPI, Celery, PostgreSQL, and Streamlit analyst workbench."
 readme = "README.md"
