@@ -1,0 +1,132 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: seiz_postgres
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_DB: "${POSTGRES_DB:-seiz_tracker}"
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-seiz_tracker}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - seiz_network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: seiz_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - seiz_network
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: seiz_api
+    command:
+      [
+        "sh",
+        "-c",
+        "alembic upgrade head && uvicorn src.api.main:app --host 0.0.0.0 --port 8000",
+      ]
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-seiz_tracker}"
+      REDIS_URL: "redis://redis:6379/0"
+      CELERY_BROKER_URL: "redis://redis:6379/0"
+      CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+      SEIZ_API_KEY: "${SEIZ_API_KEY:-seiz-secret-api-key}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - seiz_shared_data:/app/data
+    networks:
+      - seiz_network
+    restart: unless-stopped
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      [
+        "celery",
+        "-A",
+        "src.workers.celery_app:celery_app",
+        "worker",
+        "--loglevel=info",
+      ]
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-seiz_tracker}"
+      REDIS_URL: "redis://redis:6379/0"
+      CELERY_BROKER_URL: "redis://redis:6379/0"
+      CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+      SEIZ_API_KEY: "${SEIZ_API_KEY:-seiz-secret-api-key}"
+    deploy:
+      mode: replicated
+      replicas: 2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - seiz_shared_data:/app/data
+    networks:
+      - seiz_network
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: seiz_ui
+    command:
+      [
+        "streamlit",
+        "run",
+        "src/ui/app.py",
+        "--server.port=8501",
+        "--server.address=0.0.0.0",
+        "--server.headless=true",
+      ]
+    ports:
+      - "8501:8501"
+    environment:
+      SEIZ_API_URL: "http://api:8000"
+      API_BASE_URL: "http://api:8000"
+      SEIZ_API_KEY: "${SEIZ_API_KEY:-seiz-secret-api-key}"
+    depends_on:
+      - api
+    volumes:
+      - seiz_shared_data:/app/data
+    networks:
+      - seiz_network
+    restart: unless-stopped
+
+networks:
+  seiz_network:
+    driver: bridge
+
+volumes:
+  seiz_shared_data:
+  postgres_data:

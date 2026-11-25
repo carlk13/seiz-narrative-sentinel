@@ -1,0 +1,52 @@
+## Project Objective
+You are building a Disinformation Trajectory Simulator based on the SEIZ (Susceptible, Exposed, Infected, Skeptic) epidemiological model. This system uses Ordinary Differential Equations (ODEs) and numerical integration to predict the spread and peak velocity of digital disinformation across social networks. 
+
+## Technology Stack & Environment
+- **Language:** Python 3.12+ and C++ (via pybind11).
+- **Package Manager:** `uv` ONLY. Do not use `pip`, `conda`, or `poetry`.
+- **Core Math:** `scipy` (specifically `scipy.integrate.solve_ivp` and `scipy.optimize.minimize`), `numpy`.
+- **Backend API:** `fastapi`, `uvicorn`, `pydantic`.
+- **Frontend Dashboard:** `streamlit`, `plotly`.
+
+## Strict Engineering Constraints
+
+1. **NO Deep Learning or CUDA Dependencies**
+   - Under no circumstances should `torch`, `tensorflow`, or `transformers` be installed. 
+   - Rely strictly on deterministic differential equations and classical numerical methods. This project must maintain a minimal disk footprint to prevent "No space left on device" quota errors during environment extraction.
+
+2. **Mathematical Rigor & Mass Conservation**
+   - The SEIZ ODEs must strictly conserve mass: S(t) + E(t) + I(t) + Z(t) = N at every time step. 
+   - Derivatives must be normalized by the total population (N) to ensure transmission parameters remain stable across different network sizes.
+   - All rate parameters must be strictly bounded >= 0, and probabilities bounded between [0, 1]. Enforce this using Pydantic validators.
+
+3. **Asynchronous Computation**
+   - Numerical integration and parameter calibration (curve fitting) are heavily CPU-bound.
+   - Never run `scipy.integrate` or `scipy.optimize` directly in a FastAPI route handler, as it will lock the event loop. Always offload these to `BackgroundTasks` or a dedicated worker queue.
+
+4. **Code Quality & Typing**
+   - Enforce strict Python type hinting (`-> np.ndarray`, `-> dict`, etc.).
+   - Rely on Pydantic models for all API inputs and outputs.
+   - Use absolute imports starting from `src.` (e.g., `from src.simulation.engine import SEIZSimulator`).
+
+## Target Directory Structure
+Follow this exact layout when scaffolding modules:
+
+├── .instructions
+├── pyproject.toml
+├── src/
+│   ├── api/
+│   │   ├── main.py
+│   │   ├── routes.py
+│   ├── cpp_core/
+│   │   ├── CMakeLists.txt
+│   │   ├── model.cc
+│   ├── models/
+│   │   ├── schemas.py
+│   ├── simulation/
+│   │   ├── engine.py
+│   │   ├── calibration.py
+│   ├── ui/
+│   │   ├── app.py
+├── tests/
+│   ├── test_engine.py
+│   ├── test_api.py

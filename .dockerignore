@@ -1,0 +1,11 @@
+.venv/
+build/
+dist/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.pyd
+src/cpp_core/*.so
+.git/
+.gitignore
+tests/

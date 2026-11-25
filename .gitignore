@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Compiled C++ pybind11 extensions (built per-platform via CMake)
+src/cpp_core/*.pyd
+src/cpp_core/*.so
+
+# Virtual environments & caches
+.venv
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets & fallback SQLite databases
+.env
+*.db
+*.sqlite3

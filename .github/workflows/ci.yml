@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  lint-typecheck-build-test:
+    name: Build C++ Core, Lint, Type Check & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install C++ build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install Python dependencies with uv
+        run: uv sync
+
+      - name: Compile C++ pybind11 module
+        run: |
+          uv run cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
+          cmake --build build --config Release --parallel
+
+      - name: Run Ruff linter
+        run: uv run ruff check .
+
+      - name: Run strict Mypy type checking
+        run: uv run mypy src/
+
+      - name: Run pytest suite
+        run: uv run pytest --maxfail=1 --disable-warnings -v
